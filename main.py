@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 import aiohttp
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import (
@@ -704,10 +705,29 @@ async def set_bot_commands(bot: Bot):
     ]
     await bot.set_my_commands(commands)
 
+async def start_dummy_server():
+    """Запускает минимальный HTTP-сервер, чтобы Render видел открытый порт."""
+    app = web.Application()
+    
+    async def health_check(request):
+        return web.Response(text="OK", status=200)
+
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render передает номер порта через переменную окружения PORT (по умолчанию 10000)
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Фиктивный веб-сервер запущен на порту {port}")
 
 async def main():
     await db.init_db()
     await set_bot_commands(bot)
+    await start_dummy_server()
     logger.info("База данных готова и меню команд обновлено. Запуск Steam-монитора...")
 
     asyncio.create_task(price_monitoring_loop())
