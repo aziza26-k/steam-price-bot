@@ -52,16 +52,16 @@ class Database:
 
     async def init_db(self) -> None:
         async with aiosqlite.connect(self.db_path) as db:
-    await db.execute('''
-        CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,  -- ID пользователя Telegram
-        title TEXT,
-        url TEXT,
-        original_price REAL,
-        current_price REAL,
-        discount_percent INTEGER,
-        currency TEXT
+            await db.execute('''
+                CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,  -- ID пользователя Telegram
+                    title TEXT,
+                    url TEXT,
+                    original_price REAL,
+                    current_price REAL,
+                    discount_percent INTEGER,
+                    currency TEXT
     )
 ''')
             
