@@ -55,15 +55,16 @@ class Database:
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,  -- ID пользователя Telegram
+                    user_id INTEGER DEFAULT 0,
                     title TEXT,
                     url TEXT,
                     original_price REAL,
                     current_price REAL,
+                    last_price REAL,
                     discount_percent INTEGER,
                     currency TEXT
-    )
-''')
+              )
+         ''')
             
             # Автоматическая миграция новых колонок
             columns_to_add = [
@@ -73,10 +74,15 @@ class Database:
             ]
             for col_name, col_type in columns_to_add:
                 try:
-                    await db.execute(f"ALTER TABLE products ADD COLUMN {col_name} {col_type}")
-                except aiosqlite.OperationalError:
-                    pass  # Колонка уже существует
+                await db.execute("ALTER TABLE products ADD COLUMN user_id INTEGER DEFAULT 0")
+            except Exception:
+                pass  # Колонка уже есть, идем дальше
 
+            try:
+                await db.execute("ALTER TABLE products ADD COLUMN last_price REAL")
+            except Exception:
+                pass  # Колонка уже есть, идем дальше
+                
             await db.commit()
 
     async def get_all_products(self) -> list[Product]:
@@ -111,8 +117,10 @@ async def add_product(self, user_id: int, title: str, url: str, orig_price: floa
 # Получение списка игр конкретного пользователя (для /list, /deals, /clear)
 async def get_user_products(self, user_id: int):
     async with aiosqlite.connect(self.db_path) as db:
+        db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM products WHERE user_id = ?", (user_id,)) as cursor:
-            # Возвращаем список игр только этого пользователя
+        return await cursor.fetchall()
+            
             ...
 
     async def delete_product(self, product_id: int) -> bool:
