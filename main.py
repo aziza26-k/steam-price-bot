@@ -18,6 +18,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ logger = logging.getLogger("PriceMonitor")
 class Product:
     """Модель товара Steam."""
     id: Optional[int]
+    user_id: int
     url: str
     title: Optional[str] = None
     original_price: Optional[float] = None
@@ -58,44 +60,41 @@ class Database:
                     user_id INTEGER DEFAULT 0,
                     title TEXT,
                     url TEXT,
-                    original_price REAL,
-                    current_price REAL,
-                    last_price REAL,
-                    discount_percent INTEGER,
-                    currency TEXT
-              )
-         ''')
+                    original_price REAL DEFAULT 0.0,
+                    last_price REAL DEFAULT 0.0,
+                    discount_percent INTEGER DEFAULT 0,
+                    currency TEXT DEFAULT ''
+                )
+            ''')
             
-            # Автоматическая миграция новых колонок
+            # Автоматическая миграция колонок
             columns_to_add = [
+                ("user_id", "INTEGER DEFAULT 0"),
                 ("original_price", "REAL DEFAULT 0.0"),
+                ("last_price", "REAL DEFAULT 0.0"),
                 ("discount_percent", "INTEGER DEFAULT 0"),
                 ("currency", "TEXT DEFAULT ''")
             ]
             for col_name, col_type in columns_to_add:
+                try:
+                    await db.execute(f"ALTER TABLE products ADD COLUMN {col_name} {col_type}")
+                except Exception:
+                    pass  # Колонка уже существует
 
-            try:
-                await db.execute("ALTER TABLE products ADD COLUMN user_id INTEGER DEFAULT 0")
-            except Exception:
-                pass  # Колонка уже есть, идем дальше
-
-            try:
-                await db.execute("ALTER TABLE products ADD COLUMN last_price REAL")
-            except Exception:
-                pass  # Колонка уже есть, идем дальше
-                
             await db.commit()
 
     async def get_all_products(self) -> list[Product]:
+        """Возвращает все продукты из базы для фонового мониторинга."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT id, url, title, original_price, last_price, discount_percent, currency FROM products"
+                "SELECT id, user_id, url, title, original_price, last_price, discount_percent, currency FROM products"
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [
                     Product(
                         id=row["id"],
+                        user_id=row["user_id"] or 0,
                         url=row["url"],
                         title=row["title"],
                         original_price=row["original_price"],
@@ -106,25 +105,58 @@ class Database:
                     for row in rows
                 ]
 
-    # Добавление игры с привязкой к пользователю
-async def add_product(self, user_id: int, title: str, url: str, orig_price: float, current_price: float, discount: int, currency: str):
-    async with aiosqlite.connect(self.db_path) as db:
-        await db.execute(
-            "INSERT INTO products (user_id, title, url, original_price, current_price, discount_percent, currency) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, title, url, orig_price, current_price, discount, currency)
-        )
-        await db.commit()
+    async def get_user_products(self, user_id: int) -> list[Product]:
+        """Получение списка игр конкретного пользователя."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, user_id, url, title, original_price, last_price, discount_percent, currency FROM products WHERE user_id = ?",
+                (user_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    Product(
+                        id=row["id"],
+                        user_id=row["user_id"],
+                        url=row["url"],
+                        title=row["title"],
+                        original_price=row["original_price"],
+                        current_price=row["last_price"],
+                        discount_percent=row["discount_percent"] or 0,
+                        currency=row["currency"] or ""
+                    )
+                    for row in rows
+                ]
 
-# Получение списка игр конкретного пользователя (для /list, /deals, /clear)
-async def get_user_products(self, user_id: int):
-    async with aiosqlite.connect(self.db_path) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM products WHERE user_id = ?", (user_id,)) as cursor:
-        return await cursor.fetchall()
-            
-            ...
+    async def add_product(
+        self,
+        user_id: int,
+        url: str,
+        title: str = "",
+        orig_price: float = 0.0,
+        current_price: float = 0.0,
+        discount: int = 0,
+        currency: str = ""
+    ) -> bool:
+        """Добавление игры с привязкой к пользователю. Возвращает False, если ссылка уже добавлена."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id FROM products WHERE user_id = ? AND url = ?", (user_id, url)
+            ) as cursor:
+                if await cursor.fetchone():
+                    return False
+
+            await db.execute(
+                """INSERT INTO products 
+                   (user_id, title, url, original_price, last_price, discount_percent, currency) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, title, url, orig_price, current_price, discount, currency)
+            )
+            await db.commit()
+            return True
 
     async def delete_product(self, product_id: int) -> bool:
+        """Удаляет запись о продукте по ID."""
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute("DELETE FROM products WHERE id = ?", (product_id,))
             await db.commit()
@@ -139,23 +171,22 @@ async def get_user_products(self, user_id: int):
         discount_percent: int,
         currency: str
     ) -> None:
-        """Обновляет полное состояние игры в базе данных."""
+        """Обновляет состояние игры в базе данных."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
                 UPDATE products 
-                SET title = ?, original_price = ?, last_price = ?, discount_percent = ?, currency = ?, updated_at = CURRENT_TIMESTAMP 
+                SET title = ?, original_price = ?, last_price = ?, discount_percent = ?, currency = ?
                 WHERE id = ?
                 """,
                 (title, original_price, current_price, discount_percent, currency, product_id)
             )
             await db.commit()
 
-
-    async def clear_all_products(self) -> int:
-        """Полностью очищает таблицу продуктов и возвращает количество удаленных строк."""
+    async def clear_user_products(self, user_id: int) -> int:
+        """Очищает список продуктов конкретного пользователя."""
         async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute("DELETE FROM products")
+            cursor = await db.execute("DELETE FROM products WHERE user_id = ?", (user_id,))
             await db.commit()
             return cursor.rowcount
 
@@ -168,7 +199,6 @@ class ScraperService:
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8"
     }
 
-    # Обход проверки возраста (18+)
     COOKIES = {
         "birthtime": "568028401",
         "lastagecheckage": "1-0-1988",
@@ -176,8 +206,7 @@ class ScraperService:
     }
 
     async def search_steam_game(self, session: aiohttp.ClientSession, query: str) -> Optional[str]:
-        """Ищет игру в Steam по названию и возвращает ссылку на первый результат."""
-        # 1. Поиск через официальный API Steam
+        """Ищет игру в Steam по названию и возвращает ссылку."""
         search_api_url = "https://store.steampowered.com/api/storesearch/"
         params = {"term": query, "l": "russian", "cc": "US"}
         try:
@@ -191,7 +220,6 @@ class ScraperService:
         except Exception as e:
             logger.error(f"Ошибка поиска через API: {e}")
 
-        # 2. Резервный вариант через парсинг результатов поиска HTML
         try:
             html_search_url = f"https://store.steampowered.com/search/?term={quote(query)}"
             async with session.get(html_search_url, headers=self.HEADERS, cookies=self.COOKIES, timeout=10) as resp:
@@ -208,7 +236,7 @@ class ScraperService:
 
     @staticmethod
     def _extract_number_and_currency(raw_str: str) -> tuple[Optional[float], str]:
-        """Извлекает числовое значение и символ валюты из строки."""
+        """Извлекает число и символ валюты из строки."""
         currency = ""
         if "£" in raw_str:
             currency = "£"
@@ -218,7 +246,7 @@ class ScraperService:
             currency = "€"
         elif "₼" in raw_str or "AZN" in raw_str:
             currency = "₼"
-        elif "₽" in raw_str or "руб" in raw_str.lower() or "pуб" in raw_str.lower():
+        elif "₽" in raw_str or "руб" in raw_str.lower():
             currency = "₽"
 
         clean_str = re.sub(r"[^\d.,]", "", raw_str).replace(",", ".")
@@ -237,7 +265,6 @@ class ScraperService:
                 html_text = await response.text()
                 soup = BeautifulSoup(html_text, "html.parser")
 
-                # Название игры
                 title_tag = (
                     soup.find("div", class_="apphub_AppName") or
                     soup.find("span", id="largeiteminfo_item_name") or
@@ -247,7 +274,6 @@ class ScraperService:
                 if hasattr(title_tag, "get") and title_tag.get("content"):
                     title = title_tag.get("content").strip()
 
-                # Парсинг скидочных элементов Steam Store
                 disc_pct_elem = soup.select_one(".discount_pct")
                 disc_orig_elem = soup.select_one(".discount_original_price")
                 disc_final_elem = soup.select_one(".discount_final_price")
@@ -258,16 +284,13 @@ class ScraperService:
                     pct_digits = re.sub(r"[^\d]", "", disc_pct_elem.text)
                     discount_percent = int(pct_digits) if pct_digits else 0
 
-                # 1. Вариант: Игра сейчас со скидкой
                 if disc_orig_elem and disc_final_elem:
                     orig_price, currency = self._extract_number_and_currency(disc_orig_elem.text.strip())
                     final_price, _ = self._extract_number_and_currency(disc_final_elem.text.strip())
                     return title, orig_price, final_price, discount_percent, currency
 
-                # 2. Вариант: Игра продается по обычной цене (без скидки)
                 if regular_price_elem:
                     price, currency = self._extract_number_and_currency(regular_price_elem.text.strip())
-                    # Бесплатные игры (Free to Play)
                     if "free" in regular_price_elem.text.lower() or "бесплатно" in regular_price_elem.text.lower():
                         return title, 0.0, 0.0, 0, currency
                     return title, price, price, 0, currency
@@ -282,9 +305,11 @@ class ScraperService:
 # --- ИНИЦИАЛИЗАЦИЯ И КЛАВИАТУРЫ ---
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8616500960:AAG8IFKucBCHWFwZjnRirO25PU36PdFxdsk")
-CHAT_ID = os.getenv("CHAT_ID", "791444289")
-DB_PATH = os.getenv("DB_PATH", "monitor.db")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+
+# Автовыбор пути к БД для локального запуска или облака (Amvera/Render)
+DB_DIR = "/data" if os.path.exists("/data") else "."
+DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR, "monitor.db"))
 
 db = Database(DB_PATH)
 scraper = ScraperService()
@@ -295,7 +320,7 @@ dp = Dispatcher()
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📋 Список игр")],
+            [KeyboardButton(text="📋 Список игр"), KeyboardButton(text="🔥 Скидки")],
             [KeyboardButton(text="➕ Добавить игру"), KeyboardButton(text="❓ Помощь")]
         ],
         resize_keyboard=True
@@ -307,33 +332,29 @@ def get_delete_inline_btn(product_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(
                 text="🗑️ Удалить из отслеживания", 
-                callback_data=f"delete_{product_id}"  # <-- Важно: префикс delete_
+                callback_data=f"delete_{product_id}"
             )
         ]
     ])
 
+
 # --- ХЭНДЛЕРЫ БОТА ---
 
-from aiogram.types import ReplyKeyboardRemove
-
 @dp.message(Command("start"))
+@dp.message(Command("help"))
 @dp.message(F.text == "❓ Помощь")
 async def cmd_start(message: types.Message):
     text = (
         "🎮 <b>Мониторинг скидок Steam</b>\n\n"
         "Вам больше не нужно отслеживать распродажи вручную!\n"
         "Отправьте название или ссылку на игру в Steam, и бот будет следить за скидками.\n\n"
-        "<b>Примеры:</b>\n"
+        "<b>Примеры команд:</b>\n"
         "• <code>/add Witcher 3</code>\n"
         "• <code>/add https://store.steampowered.com/app/271590/Grand_Theft_Auto_V/</code>"
     )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
-    # Отправляем текст приветствия и одновременно убираем старую нижнюю клавиатуру у пользователя
-    await message.answer(
-        text, 
-        parse_mode="HTML", 
-        reply_markup=ReplyKeyboardRemove()
-    )
+
 @dp.message(F.text == "➕ Добавить игру")
 async def cmd_how_to_add(message: types.Message):
     text = (
@@ -359,7 +380,6 @@ async def cmd_add(message: types.Message):
     loading_msg = await message.answer("🔍 <i>Поиск игры в Steam...</i>", parse_mode="HTML")
 
     async with aiohttp.ClientSession() as session:
-        # Если передан URL — используем его, иначе ищем через поиск Steam
         if user_input.startswith("http://") or user_input.startswith("https://"):
             target_url = user_input
         else:
@@ -373,34 +393,29 @@ async def cmd_add(message: types.Message):
             )
             return
 
-        # Пробуем сохранить ссылку в базу
-        success = await db.add_product(target_url)
-        if not success:
-            await loading_msg.edit_text("⚠️ Эта игра уже есть в вашем списке отслеживания.")
-            return
-
-        # Парсим цены и данные со страницы Steam
         await loading_msg.edit_text("⏳ <i>Игра найдена! Получаем цены...</i>", parse_mode="HTML")
         title, orig_price, current_price, discount_pct, currency = await scraper.fetch_steam_game(session, target_url)
 
-    products = await db.get_all_products()
-    added_product = next((p for p in products if p.url == target_url), None)
+    title_to_save = title or user_input
+    success = await db.add_product(
+        user_id=message.from_user.id,
+        url=target_url,
+        title=title_to_save,
+        orig_price=orig_price or current_price or 0.0,
+        current_price=current_price or 0.0,
+        discount=discount_pct,
+        currency=currency
+    )
 
-    if added_product and current_price is not None:
-        title_to_save = title or user_input
-        await db.update_product_data(
-            added_product.id,
-            title_to_save,
-            orig_price or current_price,
-            current_price,
-            discount_pct,
-            currency
-        )
+    if not success:
+        await loading_msg.edit_text("⚠️ Эта игра уже есть в вашем списке отслеживания.")
+        return
 
-        curr = f" {currency}" if currency else ""
-        safe_title = html.escape(title_to_save)
-        safe_url = html.escape(target_url)
+    curr = f" {currency}" if currency else ""
+    safe_title = html.escape(title_to_save)
+    safe_url = html.escape(target_url)
 
+    if current_price is not None:
         if discount_pct > 0:
             price_info = (
                 f"🏷️ Оригинальная цена: <s>{orig_price}{curr}</s>\n"
@@ -430,13 +445,13 @@ async def cmd_add(message: types.Message):
 async def cmd_list(message: types.Message):
     try:
         user_products = await db.get_user_products(message.from_user.id)
-        if not products:
-            await message.answer("📭 Список отслеживаемых игр пуст.", reply_markup=get_main_keyboard())
+        if not user_products:
+            await message.answer("📭 Ваш список отслеживаемых игр пуст.", reply_markup=get_main_keyboard())
             return
 
-        await message.answer("📋 <b>Отслеживаемые игры Steam:</b>", parse_mode="HTML")
+        await message.answer("📋 <b>Ваши отслеживаемые игры Steam:</b>", parse_mode="HTML")
 
-        for p in products:
+        for p in user_products:
             raw_title = p.title or "Новая игра (идет получение данных...)"
             title = html.escape(raw_title)
             safe_url = html.escape(p.url)
@@ -474,16 +489,11 @@ async def cmd_list(message: types.Message):
 @dp.callback_query(F.data.startswith("delete_"))
 async def process_delete_game(callback: CallbackQuery):
     try:
-        # Достаем ID игры из "delete_12" -> 12
         product_id = int(callback.data.split("_")[1])
-        
-        # Вызываем ваш метод из БД
         success = await db.delete_product(product_id)
         
         if success:
-            # Обязательно гасим анимацию загрузки на кнопке
             await callback.answer("Игра удалена из списка!")
-            # Обновляем текст сообщения
             await callback.message.edit_text("🗑️ <i>Игра удалена из отслеживания.</i>", parse_mode="HTML")
         else:
             await callback.answer("⚠️ Игра не найдена в базе.", show_alert=True)
@@ -491,14 +501,14 @@ async def process_delete_game(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"Ошибка при удалении: {e}")
         await callback.answer("❌ Произошла ошибка при удалении.", show_alert=True)
-        
+
 
 @dp.message(Command("deals"))
 @dp.message(F.text == "🔥 Скидки")
 async def cmd_deals(message: types.Message):
     try:
-        products = await db.get_all_products()
-        deals = [p for p in products if p.discount_percent > 0]
+        user_products = await db.get_user_products(message.from_user.id)
+        deals = [p for p in user_products if p.discount_percent > 0]
         
         if not deals:
             await message.answer("📭 Прямо сейчас в вашем списке нет игр со скидками.")
@@ -527,20 +537,21 @@ async def cmd_deals(message: types.Message):
         logger.error(f"Ошибка в /deals: {e}")
         await message.answer("⚠️ Произошла ошибка при загрузке скидок.")
 
+
 @dp.message(Command("check"))
 async def cmd_check(message: types.Message):
-    status_msg = await message.answer("🔄 <i>Запущена принудительная проверка цен... Пожалуйста, подождите.</i>", parse_mode="HTML")
+    status_msg = await message.answer("🔄 <i>Запущена проверка цен ваших игр... Подождите.</i>", parse_mode="HTML")
     checked_count = 0
     updated_count = 0
     
     try:
-        products = await db.get_all_products()
-        if not products:
-            await status_msg.edit_text("📭 Список отслеживания пуст, проверять нечего.")
+        user_products = await db.get_user_products(message.from_user.id)
+        if not user_products:
+            await status_msg.edit_text("📭 Ваш список отслеживания пуст, проверять нечего.")
             return
 
         async with aiohttp.ClientSession() as session:
-            for product in products:
+            for product in user_products:
                 title, orig_price, current_price, discount_pct, currency = await scraper.fetch_steam_game(session, product.url)
                 if current_price is not None:
                     title_to_save = title or product.title or "Игра Steam"
@@ -553,7 +564,7 @@ async def cmd_check(message: types.Message):
 
         await status_msg.edit_text(
             f"✅ <b>Проверка успешно завершена!</b>\n\n"
-            f"• Проверено игр: <b>{checked_count}</b>\n"
+            f"• Проверено ваших игр: <b>{checked_count}</b>\n"
             f"• Обновлено данных: <b>{updated_count}</b>",
             parse_mode="HTML"
         )
@@ -561,16 +572,17 @@ async def cmd_check(message: types.Message):
         logger.error(f"Ошибка в /check: {e}")
         await status_msg.edit_text("⚠️ Произошла ошибка при проверке цен.")
 
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     try:
-        products = await db.get_all_products()
-        total_count = len(products)
+        user_products = await db.get_user_products(message.from_user.id)
+        total_count = len(user_products)
         if total_count == 0:
-            await message.answer("📊 <b>Статистика мониторинга:</b>\n\nСписок отслеживания пуст.", parse_mode="HTML")
+            await message.answer("📊 <b>Статистика мониторинга:</b>\n\nВаш список отслеживания пуст.", parse_mode="HTML")
             return
 
-        deals_count = sum(1 for p in products if p.discount_percent > 0)
+        deals_count = sum(1 for p in user_products if p.discount_percent > 0)
         
         text = (
             f"📊 <b>Статистика вашего Steam-монитора:</b>\n\n"
@@ -584,11 +596,12 @@ async def cmd_stats(message: types.Message):
         logger.error(f"Ошибка в /stats: {e}")
         await message.answer("⚠️ Ошибка при получении статистики.")
 
+
 @dp.message(Command("clear"))
 async def cmd_clear(message: types.Message):
-    products = await db.get_all_products()
-    if not products:
-        await message.answer("📭 Список и так пуст.")
+    user_products = await db.get_user_products(message.from_user.id)
+    if not user_products:
+        await message.answer("📭 Ваш список и так пуст.")
         return
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -598,20 +611,22 @@ async def cmd_clear(message: types.Message):
         ]
     ])
     await message.answer(
-        f"⚠️ <b>Внимание!</b> Вы действительно хотите удалить все игры (<b>{len(products)} шт.</b>) из списка отслеживания?",
+        f"⚠️ <b>Внимание!</b> Вы действительно хотите удалить все ваши игры (<b>{len(user_products)} шт.</b>) из списка?",
         parse_mode="HTML",
         reply_markup=keyboard
     )
 
+
 @dp.callback_query(F.data == "confirm_clear")
 async def process_confirm_clear(callback: CallbackQuery):
     try:
-        count = await db.clear_all_products()
-        await callback.answer("🗑️ Список полностью очищен!")
-        await callback.message.edit_text(f"🗑️ <b>Список отслеживания очищен.</b> Удалено игр: {count}.", parse_mode="HTML")
+        count = await db.clear_user_products(callback.from_user.id)
+        await callback.answer("🗑️ Список очищен!")
+        await callback.message.edit_text(f"🗑️ <b>Ваш список отслеживания очищен.</b> Удалено игр: {count}.", parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка при очистке БД: {e}")
         await callback.answer("❌ Ошибка при очистке базы данных.", show_alert=True)
+
 
 @dp.callback_query(F.data == "cancel_clear")
 async def process_cancel_clear(callback: CallbackQuery):
@@ -622,6 +637,7 @@ async def process_cancel_clear(callback: CallbackQuery):
 # --- ФОНОВЫЙ МОНИТОРИНГ ---
 
 async def price_monitoring_loop():
+    """Бесконечный цикл проверки цен для всех пользователей."""
     while True:
         try:
             products = await db.get_all_products()
@@ -648,8 +664,8 @@ async def price_monitoring_loop():
                                 currency
                             )
 
-                        # Уведомляем, если началась распродажа или увеличилась скидка
-                        if not is_first_run and CHAT_ID:
+                        # Отправка уведомления владельцу записи при появлении/увеличении скидки
+                        if not is_first_run and product.user_id > 0:
                             if discount_pct > old_discount and discount_pct > 0:
                                 curr_str = f" {currency}" if currency else ""
                                 safe_title = html.escape(title_to_save)
@@ -662,7 +678,10 @@ async def price_monitoring_loop():
                                     f"✅ Новая цена: <b>{current_price}{curr_str}</b>\n\n"
                                     f"🔗 <a href='{safe_url}'>Купить в Steam</a>"
                                 )
-                                await bot.send_message(chat_id=product.user_id, text=alert_msg, parse_mode="HTML")
+                                try:
+                                    await bot.send_message(chat_id=product.user_id, text=alert_msg, parse_mode="HTML")
+                                except Exception as send_err:
+                                    logger.error(f"Не удалось отправить уведомление пользователю {product.user_id}: {send_err}")
 
         except Exception as e:
             logger.error(f"Ошибка в цикле проверки: {e}")
@@ -676,22 +695,24 @@ async def set_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="start", description="🚀 Перезапустить бота / Меню"),
         BotCommand(command="add", description="➕ Добавить игру (название или ссылка)"),
-        BotCommand(command="list", description="📋 Список всех игр"),
-        BotCommand(command="deals", description="🔥 Игры со скидками прямо сейчас"),
+        BotCommand(command="list", description="📋 Мои отслеживаемые игры"),
+        BotCommand(command="deals", description="🔥 Игры со скидками из моего списка"),
         BotCommand(command="check", description="🔄 Принудительно проверить цены"),
-        BotCommand(command="stats", description="📊 Статистика отслеживания"),
-        BotCommand(command="clear", description="🗑️ Очистить весь список"),
+        BotCommand(command="stats", description="📊 Моя статистика"),
+        BotCommand(command="clear", description="🗑️ Очистить мой список"),
         BotCommand(command="help", description="❓ Справка и помощь"),
     ]
     await bot.set_my_commands(commands)
 
+
 async def main():
     await db.init_db()
-    await set_bot_commands(bot)  # <-- Регистрируем меню команд в Telegram
+    await set_bot_commands(bot)
     logger.info("База данных готова и меню команд обновлено. Запуск Steam-монитора...")
 
     asyncio.create_task(price_monitoring_loop())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     try:
