@@ -73,7 +73,8 @@ class Database:
                 ("currency", "TEXT DEFAULT ''")
             ]
             for col_name, col_type in columns_to_add:
-                try:
+
+            try:
                 await db.execute("ALTER TABLE products ADD COLUMN user_id INTEGER DEFAULT 0")
             except Exception:
                 pass  # Колонка уже есть, идем дальше
